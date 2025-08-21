@@ -78,24 +78,17 @@ ollama pull llama3:8b
 Ensure the Ollama service is running in the background.
 
 ### 4. Microsoft Entra ID (Azure AD) App Registration
-Navigate to Microsoft Entra ID > App registrations > New registration
-
-Name it OnboardingAutomationBot, restrict to your org
-
-Copy Application (client) ID and Directory (tenant) ID
-
-Create a client secret under Certificates & secrets
-
-Under API Permissions add Microsoft Graph > Application permissions:
-
-User.Read.All
-
-GroupMember.Read.All
-
-Grant admin consent
+1. Navigate to Microsoft Entra ID > App registrations > New registration
+2. Name it `OnboardingAutomationBot`, restrict to your org
+3. Copy Application (client) ID and Directory (tenant) ID
+4. Create a client secret under Certificates & secrets
+5. Under API Permissions add Microsoft Graph > Application permissions:
+   - User.Read.All
+   - GroupMember.Read.All
+6. Grant admin consent
 
 ### 5. Environment Configuration
-Create .env in project root:
+Create `.env` in project root:
 
 ```bash
 # --- Scheduler and Worker Configuration ---
@@ -122,27 +115,21 @@ AZURE_CLIENT_ID="your-application-client-id"
 AZURE_CLIENT_SECRET="your-client-secret-value"
 
 ```
-Database Setup
+### Database Setup
 
 The application creates operational tables on first run. You must pre-populate mailboxes and configuration tables to define workflows.
 
-Schema Overview
+### Schema Overview
+- **mailboxes** → Stores mailbox credentials
+- **configuration** → Defines per-team onboarding workflows
+- **onboarding_tracker** → Tracks requests, approvals, and status
+- **onboarding_log** → Permanent record of completed onboardings
+- **processed_uids** → Prevents reprocessing same email
+- **app_state** → Stores last-checked timestamps
 
-mailboxes: Stores mailbox credentials
+Includes triggers (`trigger_set_timestamp`) to auto-update `updated_at`.
 
-configuration: Defines per-team onboarding workflows
-
-onboarding_tracker: Tracks requests, approvals, and status
-
-onboarding_log: Permanent record of completed onboardings
-
-processed_uids: Prevents reprocessing same email
-
-app_state: Stores last-checked timestamps
-
-Includes triggers (trigger_set_timestamp) to auto-update updated_at.
-
-Example: Shared Mailbox & Configurations
+### Example SQL: Shared Mailbox & Configurations
 
 ```sql
 -- Shared mailbox
@@ -170,42 +157,35 @@ SET target_column_mappings = '{"email_column": "email", "active_column": "active
 WHERE config_id = 'DEV_Onboarding';
 ```
 
-Running the Application
-
+## ▶️ Running the Application
 From project root with venv active:
+
 ```bash
 python run.py
 ```
-Best Practices
 
-Use shared mailboxes for multiple small teams to reduce overhead
+---
 
-Secure secrets using Azure Key Vault or HashiCorp Vault instead of plain .env
+## ✅ Best Practices
+- Use shared mailboxes for multiple small teams to reduce overhead
+- Secure secrets using Azure Key Vault or HashiCorp Vault instead of plain `.env`
+- Configure indexes on frequently queried columns (already included in schema)
+- Rotate client secrets regularly
+- Keep worker pool sizes small (5–10) unless handling high volume
 
-Configure indexes on frequently queried columns (already included in schema)
+---
 
-Rotate client secrets regularly
+## ⚠️ Limitations
+- Relies on IMAP/SMTP connectivity; no direct Graph API mail read yet
+- Requires local Ollama instance — no remote fallback
+- Approval flows are sequential only (parallel not supported yet)
+- Assumes stable DB connectivity
 
-Keep worker pool sizes small (5–10) unless handling high volume
+---
 
-Limitations
-
-Relies on IMAP/SMTP connectivity; no direct Graph API mail read yet
-
-Requires local Ollama instance — no remote fallback
-
-Approval flows are sequential only (parallel not supported yet)
-
-Assumes stable DB connectivity
-
-Next Steps
-
-Add parallel approval flows
-
-Extend AI classification with RAG (Retrieval-Augmented Generation)
-
-Optional cloud-hosted LLM fallback
-
-Build a dashboard UI for monitoring
-
-Support non-Azure identity providers
+## 🔮 Next Steps
+- Add parallel approval flows
+- Extend AI classification with Retrieval-Augmented Generation (RAG)
+- Optional cloud-hosted LLM fallback
+- Build a dashboard UI for monitoring
+- Support non-Azure identity providers
