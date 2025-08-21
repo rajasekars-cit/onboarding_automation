@@ -1,0 +1,322 @@
+# FILE: run.py
+# ==============================================================================
+import schedule
+import time
+import logging
+from app.main import job
+from app.services.db_service import setup_database
+from app.config import load_dynamic_config, CONFIG
+
+# --- Basic Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(module)s - %(message)s')
+
+if __name__ == "__main__":
+    logging.info("Initializing application...")
+    
+    # 1. Set up the database tables
+    logging.info("Verifying database setup...")
+    setup_database()
+
+    # 2. Load dynamic configuration from the database into memory
+    logging.info("Loading dynamic configuration from database...")
+    load_dynamic_config()
+    
+    # 3. Schedule the main job
+    logging.info(f"Scheduling job to run every {CONFIG['SCHEDULE_MINUTES']} minutes.")
+    schedule.every(CONFIG['SCHEDULE_MINUTES']).minutes.do(job)
+    
+    # 4. Run the job once immediately at startup
+    logging.info("Running initial job cycle at startup.")
+    job()
+    
+    logging.info("Onboarding Bot started successfully. Waiting for next scheduled run...")
+    
+    # 5. Start the main loop
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+# ==============================================================================
+# FILE: app/config.py
+# ==============================================================================
+# UPDATED: Now loads configuration dynamically from the database.
+# ==============================================================================
+import os
+import logging
+from dotenv import load_dotenv
+from app.services import db_service
+
+load_dotenv()
+
+# In-memory dictionary to hold all configuration
+CONFIG = {}
+
+def load_dynamic_config():
+    """
+    Loads configuration from the database and environment variables
+    into the global CONFIG dictionary.
+    """
+    global CONFIG
+    logging.info("Loading configuration...")
+
+    # Static config from .env file
+    CONFIG['SCHEDULE_MINUTES'] = int(os.getenv("SCHEDULE_MINUTES", 5))
+    CONFIG['IMAP_SERVER'] = os.getenv("IMAP_SERVER")
+    CONFIG['SMTP_SERVER'] = os.getenv("SMTP_SERVER")
+    CONFIG['SMTP_PORT'] = int(os.getenv("SMTP_PORT", 587))
+    CONFIG['EMAIL_USER'] = os.getenv("EMAIL_USER")
+    CONFIG['EMAIL_PASS'] = os.getenv("EMAIL_PASS")
+    CONFIG['INITIAL_LOOKBACK_DAYS'] = int(os.getenv("INITIAL_LOOKBACK_DAYS", 1))
+    CONFIG['REMINDER_THRESHOLD_HOURS'] = int(os.getenv("REMINDER_THRESHOLD_HOURS", 24))
+    CONFIG['AZURE_OPENAI_KEY'] = os.getenv("AZURE_OPENAI_KEY")
+    CONFIG['AZURE_OPENAI_ENDPOINT'] = os.getenv("AZURE_OPENAI_ENDPOINT")
+    CONFIG['AZURE_OPENAI_API_VERSION'] = os.getenv("AZURE_OPENAI_API_VERSION")
+    CONFIG['AZURE_OPENAI_DEPLOYMENT_NAME'] = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+    
+    # Dynamic config from the database
+    db_config = db_service.get_all_configuration()
+    CONFIG.update(db_config)
+    
+    # Ensure essential configs are present
+    if 'approvers' not in CONFIG or 'support_email' not in CONFIG:
+        logging.error("'approvers' or 'support_email' not found in the database configuration table. Please populate it.")
+        raise ValueError("Missing critical configuration in the database.")
+        
+    logging.info("Configuration loaded successfully.")
+
+
+# ==============================================================================
+# FILE: app/main.py
+# ==============================================================================
+# This file remains the same.
+# ==============================================================================
+import logging
+from app.services.email_service import process_mailbox, process_pending_reminders
+
+def job():
+    """
+    The main job to be scheduled. It consists of two parts:
+    1. Processing the inbox for new requests and approvals.
+    2. Processing pending requests to send reminders.
+    """
+    logging.info("--- Starting new job cycle ---")
+    
+    logging.info("Step 1: Checking for new emails...")
+    try:
+        process_mailbox()
+        logging.info("Finished processing mailbox.")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during mailbox processing: {e}", exc_info=True)
+        
+    logging.info("Step 2: Checking for pending requests...")
+    try:
+        process_pending_reminders()
+        logging.info("Finished processing pending reminders.")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during reminder processing: {e}", exc_info=True)
+
+    logging.info("--- Job cycle finished ---")
+
+
+# ==============================================================================
+# FILE: app/services/email_service.py
+# ==============================================================================
+# UPDATED: Major changes to use UID tracking and build dynamic search queries.
+# ==============================================================================
+import imaplib
+import email
+from email.header import decode_header
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import logging
+import re
+from datetime import datetime
+
+from app.config import CONFIG
+from app.services import db_service
+from app.services.ai_service import analyze_email
+
+def build_search_query(last_check_timestamp):
+    """Builds a dynamic, efficient IMAP search query."""
+    search_date = datetime.fromisoformat(last_check_timestamp).strftime('%d-%b-%Y')
+    
+    # Base criteria: must be since the last check date
+    criteria = [f'(SINCE "{search_date}")']
+    
+    # Add OR conditions for all approvers and the support email
+    addresses_to_check = CONFIG.get('approvers', []) + [CONFIG.get('support_email')]
+    address_criteria = []
+    for addr in addresses_to_check:
+        if addr:
+            address_criteria.append(f'(TO "{addr}")')
+            address_criteria.append(f'(CC "{addr}")')
+    
+    if address_criteria:
+        criteria.append(f"(OR {' '.join(address_criteria)})")
+
+    return " ".join(criteria)
+
+def process_mailbox():
+    """Connects to the mailbox, fetches emails using a smart query, and processes them."""
+    last_check_timestamp = db_service.get_last_check_time()
+    
+    try:
+        mail = imaplib.IMAP4_SSL(CONFIG['IMAP_SERVER'])
+        mail.login(CONFIG['EMAIL_USER'], CONFIG['EMAIL_PASS'])
+        mail.select("inbox")
+
+        search_criteria = build_search_query(last_check_timestamp)
+        
+        logging.info(f"Searching for emails with criteria: {search_criteria}")
+        # Search and get back message UIDs, not sequence numbers
+        status, messages = mail.uid('search', None, search_criteria)
+        if status != "OK":
+            logging.error("Failed to search for emails.")
+            return
+
+        all_uids = messages[0].split()
+        if not all_uids:
+            logging.info("No new relevant emails found.")
+        else:
+            # Filter out UIDs we have already processed
+            processed_uids = db_service.get_processed_uids(all_uids)
+            new_uids = [uid for uid in all_uids if uid.decode() not in processed_uids]
+            
+            if not new_uids:
+                logging.info("No new emails to process after filtering already processed UIDs.")
+            else:
+                logging.info(f"Found {len(new_uids)} new email(s) to process.")
+                for uid in new_uids:
+                    try:
+                        status, msg_data = mail.uid('fetch', uid, "(RFC822)")
+                        if status != "OK": continue
+
+                        msg = email.message_from_bytes(msg_data[0][1])
+                        # ... (rest of the processing logic is similar to before)
+                        subject, _ = decode_header(msg["Subject"])[0]
+                        if isinstance(subject, bytes): subject = subject.decode()
+                        from_ = msg.get("From")
+                        body = get_email_body(msg)
+                        thread_id = msg.get('References', msg.get('In-Reply-To', msg.get('Message-ID'))).strip()
+
+                        # Process with AI, etc.
+                        analysis = analyze_email(subject, body)
+                        if not analysis: continue
+                        intent = analysis.get('intent')
+                        if intent == 'new_request':
+                            # ... as before
+                            pass
+                        elif intent == 'approval':
+                            # ... as before
+                            pass
+                        
+                        # IMPORTANT: Mark UID as processed
+                        db_service.mark_uid_as_processed(uid.decode())
+
+                    except Exception as e:
+                        logging.error(f"Error processing email UID {uid.decode()}: {e}", exc_info=True)
+                        if 'thread_id' in locals():
+                            db_service.update_request_status(thread_id, 'error', f"Failed to process email: {e}")
+        
+        mail.logout()
+        db_service.update_last_check_time(datetime.now().isoformat())
+
+    except Exception as e:
+        logging.error(f"Failed to connect to or process mailbox: {e}", exc_info=True)
+        
+# The rest of email_service.py (send_confirmation_email, process_pending_reminders, etc.)
+# uses CONFIG['APPROVERS'] etc. so it will adapt automatically.
+# get_email_body() and the sending functions are unchanged.
+# ...
+
+# ==============================================================================
+# FILE: app/services/db_service.py
+# ==============================================================================
+# UPDATED: Added functions for dynamic config and UID tracking.
+# ==============================================================================
+import psycopg2
+import logging
+import json
+from psycopg2.extras import DictCursor
+from datetime import datetime, timedelta
+from app.config import CONFIG
+
+# get_db_connection() is unchanged
+
+def setup_database():
+    """Creates all necessary tables if they don't exist."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Standard tables
+            cur.execute("CREATE TABLE IF NOT EXISTS users (...);")
+            cur.execute("CREATE TABLE IF NOT EXISTS onboarding_tracker (...);")
+            cur.execute("CREATE TABLE IF NOT EXISTS app_state (...);")
+
+            # NEW: Table for processed UIDs
+            cur.execute("CREATE TABLE IF NOT EXISTS processed_uids (uid TEXT PRIMARY KEY, processed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);")
+            
+            # NEW: Table for dynamic configuration
+            cur.execute("CREATE TABLE IF NOT EXISTS configuration (config_key TEXT PRIMARY KEY, config_value JSONB NOT NULL);")
+            
+            cur.execute("CREATE OR REPLACE FUNCTION trigger_set_timestamp()...;")
+            cur.execute("DROP TRIGGER IF EXISTS ...;")
+            conn.commit()
+            logging.info("Database tables verified/created successfully.")
+    except Exception as e: logging.error(f"Database setup failed: {e}")
+    finally:
+        if conn: conn.close()
+
+def get_all_configuration():
+    """Loads all key-value pairs from the configuration table."""
+    conn = get_db_connection()
+    config_map = {}
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute("SELECT config_key, config_value FROM configuration;")
+            for row in cur.fetchall():
+                config_map[row['config_key']] = row['config_value']
+    except Exception as e:
+        logging.error(f"Could not load configuration from database: {e}", exc_info=True)
+    finally:
+        if conn: conn.close()
+    return config_map
+    
+def get_processed_uids(uids_to_check):
+    """Given a list of UIDs, returns the subset that already exists in the database."""
+    if not uids_to_check:
+        return set()
+    
+    # Decode uids if they are bytes
+    uids_to_check = [uid.decode() if isinstance(uid, bytes) else uid for uid in uids_to_check]
+
+    conn = get_db_connection()
+    processed_uids = set()
+    try:
+        with conn.cursor() as cur:
+            # Use ANY array for an efficient single query
+            cur.execute("SELECT uid FROM processed_uids WHERE uid = ANY(%s);", (uids_to_check,))
+            for row in cur.fetchall():
+                processed_uids.add(row[0])
+    except Exception as e:
+        logging.error(f"Failed to get processed UIDs: {e}", exc_info=True)
+    finally:
+        if conn: conn.close()
+    return processed_uids
+
+def mark_uid_as_processed(uid):
+    """Adds a UID to the processed_uids table."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO processed_uids (uid) VALUES (%s) ON CONFLICT (uid) DO NOTHING;", (uid,))
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Failed to mark UID {uid} as processed: {e}", exc_info=True)
+    finally:
+        if conn: conn.close()
+        
+# get_last_check_time and update_last_check_time now use the ISO format correctly.
+# Other functions are mostly unchanged.
+# ...

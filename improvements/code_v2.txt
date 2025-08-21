@@ -1,0 +1,549 @@
+# FILE: run.py
+# ==============================================================================
+import schedule
+import time
+import logging
+from app.main import job
+from app.services.db_service import setup_database
+from app.config import load_dynamic_config, CONFIG
+
+# --- Basic Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(module)s - %(message)s')
+
+if __name__ == "__main__":
+    logging.info("Initializing application...")
+    
+    # 1. Set up the database tables
+    logging.info("Verifying database setup...")
+    setup_database()
+
+    # 2. Load dynamic configuration from the database into memory
+    logging.info("Loading dynamic configuration from database...")
+    load_dynamic_config()
+    
+    # 3. Schedule the main job
+    logging.info(f"Scheduling job to run every {CONFIG['SCHEDULE_MINUTES']} minutes.")
+    schedule.every(CONFIG['SCHEDULE_MINUTES']).minutes.do(job)
+    
+    # 4. Run the job once immediately at startup
+    logging.info("Running initial job cycle at startup.")
+    job()
+    
+    logging.info("Onboarding Bot started successfully. Waiting for next scheduled run...")
+    
+    # 5. Start the main loop
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+# ==============================================================================
+# FILE: app/config.py
+# ==============================================================================
+# UPDATED: Now loads configuration dynamically from the database.
+# ==============================================================================
+import os
+import logging
+from dotenv import load_dotenv
+from app.services import db_service
+
+load_dotenv()
+
+# In-memory dictionary to hold all configuration
+CONFIG = {}
+
+def load_dynamic_config():
+    """
+    Loads configuration from the database and environment variables
+    into the global CONFIG dictionary.
+    """
+    global CONFIG
+    logging.info("Loading configuration...")
+
+    # Static config from .env file
+    CONFIG['SCHEDULE_MINUTES'] = int(os.getenv("SCHEDULE_MINUTES", 5))
+    CONFIG['IMAP_SERVER'] = os.getenv("IMAP_SERVER")
+    CONFIG['SMTP_SERVER'] = os.getenv("SMTP_SERVER")
+    CONFIG['SMTP_PORT'] = int(os.getenv("SMTP_PORT", 587))
+    CONFIG['EMAIL_USER'] = os.getenv("EMAIL_USER")
+    CONFIG['EMAIL_PASS'] = os.getenv("EMAIL_PASS")
+    CONFIG['INITIAL_LOOKBACK_DAYS'] = int(os.getenv("INITIAL_LOOKBACK_DAYS", 1))
+    CONFIG['REMINDER_THRESHOLD_HOURS'] = int(os.getenv("REMINDER_THRESHOLD_HOURS", 24))
+    CONFIG['AZURE_OPENAI_KEY'] = os.getenv("AZURE_OPENAI_KEY")
+    CONFIG['AZURE_OPENAI_ENDPOINT'] = os.getenv("AZURE_OPENAI_ENDPOINT")
+    CONFIG['AZURE_OPENAI_API_VERSION'] = os.getenv("AZURE_OPENAI_API_VERSION")
+    CONFIG['AZURE_OPENAI_DEPLOYMENT_NAME'] = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+    
+    # Dynamic config from the database
+    db_config = db_service.get_all_configuration()
+    CONFIG.update(db_config)
+    
+    # Ensure essential configs are present
+    if 'approvers' not in CONFIG or 'support_email' not in CONFIG:
+        logging.error("'approvers' or 'support_email' not found in the database configuration table. Please populate it.")
+        raise ValueError("Missing critical configuration in the database.")
+        
+    logging.info("Configuration loaded successfully.")
+
+
+# ==============================================================================
+# FILE: app/main.py
+# ==============================================================================
+# This file remains the same.
+# ==============================================================================
+import logging
+from app.services.email_service import process_mailbox, process_pending_reminders
+
+def job():
+    """
+    The main job to be scheduled. It consists of two parts:
+    1. Processing the inbox for new requests and approvals.
+    2. Processing pending requests to send reminders.
+    """
+    logging.info("--- Starting new job cycle ---")
+    
+    logging.info("Step 1: Checking for new emails...")
+    try:
+        process_mailbox()
+        logging.info("Finished processing mailbox.")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during mailbox processing: {e}", exc_info=True)
+        
+    logging.info("Step 2: Checking for pending requests...")
+    try:
+        process_pending_reminders()
+        logging.info("Finished processing pending reminders.")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during reminder processing: {e}", exc_info=True)
+
+    logging.info("--- Job cycle finished ---")
+
+
+# ==============================================================================
+# FILE: app/services/email_service.py
+# ==============================================================================
+# UPDATED: Complete code for this file.
+# ==============================================================================
+import imaplib
+import email
+from email.header import decode_header
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import logging
+import re
+from datetime import datetime
+
+from app.config import CONFIG
+from app.services import db_service
+from app.services.ai_service import analyze_email
+
+def build_search_query(last_check_timestamp):
+    """Builds a dynamic, efficient IMAP search query."""
+    search_date = datetime.fromisoformat(last_check_timestamp).strftime('%d-%b-%Y')
+    
+    # Base criteria: must be since the last check date
+    criteria = [f'(SINCE "{search_date}")']
+    
+    # Add OR conditions for all approvers and the support email
+    addresses_to_check = CONFIG.get('approvers', []) + [CONFIG.get('support_email')]
+    address_criteria = []
+    for addr in addresses_to_check:
+        if addr:
+            address_criteria.append(f'(TO "{addr}")')
+            address_criteria.append(f'(CC "{addr}")')
+    
+    if address_criteria:
+        # Wrap all address checks in a single OR condition
+        criteria.append(f"(OR {' '.join(address_criteria)})")
+
+    return " ".join(criteria)
+
+def get_email_body(msg):
+    """Extracts the text body from an email message."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain" and "attachment" not in str(part.get("Content-Disposition")):
+                try: return part.get_payload(decode=True).decode()
+                except: return part.get_payload(decode=True).decode('latin-1')
+    else:
+        try: return msg.get_payload(decode=True).decode()
+        except: return msg.get_payload(decode=True).decode('latin-1')
+    return ""
+
+def process_mailbox():
+    """Connects to the mailbox, fetches emails using a smart query, and processes them."""
+    last_check_timestamp = db_service.get_last_check_time()
+    
+    try:
+        mail = imaplib.IMAP4_SSL(CONFIG['IMAP_SERVER'])
+        mail.login(CONFIG['EMAIL_USER'], CONFIG['EMAIL_PASS'])
+        mail.select("inbox")
+
+        search_criteria = build_search_query(last_check_timestamp)
+        
+        logging.info(f"Searching for emails with criteria: {search_criteria}")
+        # Search and get back message UIDs, not sequence numbers
+        status, messages = mail.uid('search', None, search_criteria)
+        if status != "OK":
+            logging.error("Failed to search for emails.")
+            return
+
+        all_uids = messages[0].split()
+        if not all_uids:
+            logging.info("No new relevant emails found.")
+        else:
+            # Filter out UIDs we have already processed
+            processed_uids = db_service.get_processed_uids(all_uids)
+            new_uids = [uid for uid in all_uids if uid.decode() not in processed_uids]
+            
+            if not new_uids:
+                logging.info("No new emails to process after filtering already processed UIDs.")
+            else:
+                logging.info(f"Found {len(new_uids)} new email(s) to process.")
+                for uid in new_uids:
+                    try:
+                        status, msg_data = mail.uid('fetch', uid, "(RFC822)")
+                        if status != "OK": continue
+
+                        msg = email.message_from_bytes(msg_data[0][1])
+                        subject, _ = decode_header(msg["Subject"])[0]
+                        if isinstance(subject, bytes): subject = subject.decode()
+                        from_ = msg.get("From")
+                        body = get_email_body(msg)
+                        thread_id = msg.get('References', msg.get('In-Reply-To', msg.get('Message-ID'))).strip()
+
+                        analysis = analyze_email(subject, body)
+                        if not analysis:
+                            db_service.mark_uid_as_processed(uid.decode())
+                            continue
+                            
+                        intent = analysis.get('intent')
+                        extracted_user_email = analysis.get('user_email')
+
+                        if intent == 'new_request' and extracted_user_email:
+                            db_service.create_onboarding_request(thread_id, extracted_user_email)
+                        
+                        elif intent == 'approval':
+                            approver_email = (re.search(r'<(.+?)>', from_) or re.search(r'[\w\.-]+@[\w\.-]+', from_)).group(0).strip('<>')
+                            if approver_email in CONFIG['approvers']:
+                                request = db_service.get_request_by_thread_id(thread_id)
+                                if not request:
+                                    logging.warning(f"Received an approval for an unknown thread ID: {thread_id}. Skipping.")
+                                else:
+                                    user_to_onboard = request['user_to_onboard_email']
+                                    all_approved = db_service.add_approval_to_request(thread_id, approver_email)
+                                    if all_approved:
+                                        logging.info(f"All approvals received for {user_to_onboard}. Granting access.")
+                                        db_service.update_user_access(user_to_onboard)
+                                        db_service.update_request_status(thread_id, 'completed', f"Access granted for {user_to_onboard}.")
+                                        send_confirmation_email(user_to_onboard, thread_id)
+                                    else:
+                                        logging.info(f"Approval from {approver_email} logged. Waiting for more approvals.")
+                            else:
+                                logging.warning(f"Received approval from non-approver: {approver_email}")
+                        
+                        # IMPORTANT: Mark UID as processed regardless of outcome to prevent reprocessing
+                        db_service.mark_uid_as_processed(uid.decode())
+
+                    except Exception as e:
+                        logging.error(f"Error processing email UID {uid.decode()}: {e}", exc_info=True)
+                        if 'thread_id' in locals():
+                            db_service.update_request_status(thread_id, 'error', f"Failed to process email: {e}")
+        
+        mail.logout()
+        db_service.update_last_check_time(datetime.now().isoformat())
+
+    except Exception as e:
+        logging.error(f"Failed to connect to or process mailbox: {e}", exc_info=True)
+
+def process_pending_reminders():
+    """Fetches stale pending requests and sends reminder emails."""
+    pending_requests = db_service.get_pending_requests_for_reminder()
+    if not pending_requests:
+        logging.info("No pending requests found that require a reminder.")
+        return
+    
+    logging.info(f"Found {len(pending_requests)} pending request(s) requiring a reminder.")
+    for request in pending_requests:
+        try:
+            send_reminder_email(request)
+        except Exception as e:
+            logging.error(f"Failed to send reminder for request ID {request['id']}: {e}", exc_info=True)
+
+def send_confirmation_email(user_email, thread_id):
+    """Sends the final confirmation email after successful onboarding."""
+    logging.info(f"Preparing to send confirmation email to {user_email}")
+    subject = "Welcome! Your Access has been Granted"
+    body = f"Hello,\n\nThis is an automated message to confirm that your account ({user_email}) has been successfully onboarded and access has been granted.\n\nBest regards,\nThe Support Team\n\n(Reference ID: {thread_id})"
+    msg = MIMEMultipart()
+    msg['From'] = CONFIG['EMAIL_USER']
+    msg['To'] = user_email
+    msg['Cc'] = ", ".join(CONFIG['approvers'] + [CONFIG['support_email']])
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+    try:
+        with smtplib.SMTP(CONFIG['SMTP_SERVER'], CONFIG['SMTP_PORT']) as server:
+            server.starttls()
+            server.login(CONFIG['EMAIL_USER'], CONFIG['EMAIL_PASS'])
+            server.send_message(msg)
+            logging.info(f"Successfully sent confirmation email to {user_email}")
+            db_service.update_request_status(thread_id, 'completed', "Confirmation email sent successfully.")
+    except Exception as e:
+        logging.error(f"Failed to send confirmation email: {e}", exc_info=True)
+        db_service.update_request_status(thread_id, 'error', f"Failed to send confirmation email: {e}")
+
+def send_reminder_email(request):
+    """Sends a reminder to approvers who have not yet approved a request."""
+    user_to_onboard = request['user_to_onboard_email']
+    thread_id = request['request_thread_id']
+    
+    approvals_received = set(request['approvals_received'])
+    all_approvers = set(CONFIG['approvers'])
+    missing_approvers = list(all_approvers - approvals_received)
+
+    if not missing_approvers:
+        logging.warning(f"Request ID {request['id']} is pending but has no missing approvers. Skipping reminder.")
+        return
+
+    logging.info(f"Preparing to send reminder for {user_to_onboard} to: {', '.join(missing_approvers)}")
+    subject = f"REMINDER: Approval Required for Onboarding {user_to_onboard}"
+    body = f"Hello,\n\nThis is an automated reminder that your approval is required for the user onboarding request for:\n\nUser: {user_to_onboard}\n\nThis request is currently pending your action. Please reply to the original request with your approval.\n\nThank you,\nAutomation Bot\n\n(Reference ID: {thread_id})"
+    
+    msg = MIMEMultipart()
+    msg['From'] = CONFIG['EMAIL_USER']
+    msg['To'] = ", ".join(missing_approvers)
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+    
+    try:
+        with smtplib.SMTP(CONFIG['SMTP_SERVER'], CONFIG['SMTP_PORT']) as server:
+            server.starttls()
+            server.login(CONFIG['EMAIL_USER'], CONFIG['EMAIL_PASS'])
+            server.send_message(msg)
+            logging.info(f"Successfully sent reminder email for request ID {request['id']}")
+            db_service.update_request_status(thread_id, 'pending_approval', f"Reminder sent to: {', '.join(missing_approvers)}")
+    except Exception as e:
+        logging.error(f"Failed to send reminder email for request ID {request['id']}: {e}", exc_info=True)
+
+
+# ==============================================================================
+# FILE: app/services/db_service.py
+# ==============================================================================
+# UPDATED: Added functions for dynamic config and UID tracking.
+# ==============================================================================
+import psycopg2
+import logging
+import json
+from psycopg2.extras import DictCursor
+from datetime import datetime, timedelta
+from app.config import CONFIG
+
+def get_db_connection():
+    """Establishes a connection to the PostgreSQL database."""
+    try:
+        conn = psycopg2.connect(
+            dbname=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASS"),
+            host=os.getenv("DB_HOST"),
+            port=os.getenv("DB_PORT")
+        )
+        return conn
+    except psycopg2.OperationalError as e:
+        logging.error(f"Could not connect to PostgreSQL database: {e}")
+        raise
+
+def setup_database():
+    """Creates all necessary tables if they don't exist."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Standard tables
+            cur.execute("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, email VARCHAR(255) UNIQUE NOT NULL, access_flag BOOLEAN DEFAULT FALSE, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);")
+            cur.execute("CREATE TABLE IF NOT EXISTS onboarding_tracker (id SERIAL PRIMARY KEY, request_thread_id TEXT UNIQUE NOT NULL, user_to_onboard_email VARCHAR(255), status VARCHAR(50) NOT NULL DEFAULT 'new', approvals_received JSONB DEFAULT '[]'::jsonb, last_activity_details TEXT, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);")
+            cur.execute("CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+
+            # NEW: Table for processed UIDs
+            cur.execute("CREATE TABLE IF NOT EXISTS processed_uids (uid TEXT PRIMARY KEY, processed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);")
+            
+            # NEW: Table for dynamic configuration
+            cur.execute("CREATE TABLE IF NOT EXISTS configuration (config_key TEXT PRIMARY KEY, config_value JSONB NOT NULL);")
+            
+            cur.execute("CREATE OR REPLACE FUNCTION trigger_set_timestamp() RETURNS TRIGGER AS $$ BEGIN NEW.updated_at = NOW(); RETURN NEW; END; $$ LANGUAGE plpgsql;")
+            cur.execute("DROP TRIGGER IF EXISTS set_timestamp ON onboarding_tracker; CREATE TRIGGER set_timestamp BEFORE UPDATE ON onboarding_tracker FOR EACH ROW EXECUTE PROCEDURE trigger_set_timestamp();")
+            conn.commit()
+            logging.info("Database tables verified/created successfully.")
+    except Exception as e: logging.error(f"Database setup failed: {e}")
+    finally:
+        if conn: conn.close()
+
+def get_all_configuration():
+    """Loads all key-value pairs from the configuration table."""
+    conn = get_db_connection()
+    config_map = {}
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute("SELECT config_key, config_value FROM configuration;")
+            for row in cur.fetchall():
+                config_map[row['config_key']] = row['config_value']
+    except Exception as e:
+        logging.error(f"Could not load configuration from database: {e}", exc_info=True)
+    finally:
+        if conn: conn.close()
+    return config_map
+    
+def get_processed_uids(uids_to_check):
+    """Given a list of UIDs, returns the subset that already exists in the database."""
+    if not uids_to_check:
+        return set()
+    
+    # Decode uids if they are bytes
+    uids_to_check_str = [uid.decode() if isinstance(uid, bytes) else uid for uid in uids_to_check]
+
+    conn = get_db_connection()
+    processed_uids = set()
+    try:
+        with conn.cursor() as cur:
+            # Use ANY array for an efficient single query
+            cur.execute("SELECT uid FROM processed_uids WHERE uid = ANY(%s);", (uids_to_check_str,))
+            for row in cur.fetchall():
+                processed_uids.add(row[0])
+    except Exception as e:
+        logging.error(f"Failed to get processed UIDs: {e}", exc_info=True)
+    finally:
+        if conn: conn.close()
+    return processed_uids
+
+def mark_uid_as_processed(uid):
+    """Adds a UID to the processed_uids table."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO processed_uids (uid) VALUES (%s) ON CONFLICT (uid) DO NOTHING;", (uid,))
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Failed to mark UID {uid} as processed: {e}", exc_info=True)
+    finally:
+        if conn: conn.close()
+        
+def get_last_check_time():
+    """Gets the last check timestamp from the database."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM app_state WHERE key = 'last_check_timestamp';")
+            result = cur.fetchone()
+            if result:
+                return result[0]
+            else:
+                initial_time = (datetime.now() - timedelta(days=CONFIG['INITIAL_LOOKBACK_DAYS'])).isoformat()
+                logging.info(f"No last check timestamp found in DB. Using initial lookback: {initial_time}")
+                return initial_time
+    except Exception as e:
+        logging.error(f"Failed to get last check time: {e}", exc_info=True)
+        return (datetime.now() - timedelta(days=1)).isoformat()
+    finally:
+        if conn: conn.close()
+
+def update_last_check_time(timestamp_iso):
+    """Updates the last check timestamp in the database."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO app_state (key, value) VALUES ('last_check_timestamp', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;", (timestamp_iso,))
+            conn.commit()
+            logging.info(f"Updated last check timestamp to: {timestamp_iso}")
+    except Exception as e:
+        logging.error(f"Failed to update last check time: {e}", exc_info=True)
+    finally:
+        if conn: conn.close()
+
+def get_pending_requests_for_reminder():
+    """Finds requests that are pending approval for longer than the threshold."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            query = "SELECT * FROM onboarding_tracker WHERE status = 'pending_approval' AND updated_at < NOW() - INTERVAL '%s hours'"
+            cur.execute(query, (CONFIG['REMINDER_THRESHOLD_HOURS'],))
+            return cur.fetchall()
+    except Exception as e:
+        logging.error(f"Failed to get pending requests: {e}", exc_info=True)
+        return []
+    finally:
+        if conn: conn.close()
+
+def create_onboarding_request(thread_id, user_email):
+    """Creates a new record in the tracker for an onboarding request."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO onboarding_tracker (request_thread_id, user_to_onboard_email, status, last_activity_details) VALUES (%s, %s, %s, %s) ON CONFLICT (request_thread_id) DO NOTHING;", (thread_id, user_email, 'pending_approval', f"New onboarding request received for {user_email}."))
+            conn.commit()
+            if cur.rowcount > 0: logging.info(f"New onboarding request created for {user_email} with thread ID {thread_id[:15]}...")
+            else: logging.info(f"Onboarding request for thread ID {thread_id[:15]}... already exists.")
+    except Exception as e: logging.error(f"Failed to create onboarding request: {e}", exc_info=True)
+    finally:
+        if conn: conn.close()
+
+def add_approval_to_request(thread_id, approver_email):
+    """Adds an approver's email to the list and checks if all approvals are in."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute("UPDATE onboarding_tracker SET approvals_received = approvals_received || %s::jsonb, last_activity_details = %s WHERE request_thread_id = %s AND NOT approvals_received @> %s::jsonb RETURNING approvals_received;", (json.dumps(approver_email), f"Approval received from {approver_email}", thread_id, json.dumps(approver_email)))
+            result = cur.fetchone()
+            conn.commit()
+            if result:
+                received_approvals = set(result['approvals_received'])
+                required_approvers = set(CONFIG['approvers'])
+                logging.info(f"Thread {thread_id[:15]}... | Required: {required_approvers} | Received: {received_approvals}")
+                return required_approvers.issubset(received_approvals)
+            return False
+    except Exception as e:
+        logging.error(f"Failed to add approval for thread {thread_id}: {e}", exc_info=True)
+        return False
+    finally:
+        if conn: conn.close()
+
+def get_request_by_thread_id(thread_id):
+    """Retrieves an onboarding request by its thread ID."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute("SELECT * FROM onboarding_tracker WHERE request_thread_id = %s;", (thread_id,))
+            return cur.fetchone()
+    except Exception as e:
+        logging.error(f"Failed to get request for thread {thread_id}: {e}", exc_info=True)
+        return None
+    finally:
+        if conn: conn.close()
+
+def update_request_status(thread_id, status, details):
+    """Updates the status and details of a request."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE onboarding_tracker SET status = %s, last_activity_details = %s WHERE request_thread_id = %s;", (status, details, thread_id))
+            conn.commit()
+            logging.info(f"Updated status for thread {thread_id[:15]}... to '{status}'")
+    except Exception as e:
+        logging.error(f"Failed to update request status: {e}", exc_info=True)
+    finally:
+        if conn: conn.close()
+
+def update_user_access(user_email):
+    """Sets the access_flag to true for a given user."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE email = %s;", (user_email,))
+            if cur.fetchone() is None:
+                logging.info(f"User {user_email} not found. Creating new user record.")
+                cur.execute("INSERT INTO users (email) VALUES (%s);", (user_email,))
+            cur.execute("UPDATE users SET access_flag = TRUE WHERE email = %s;", (user_email,))
+            conn.commit()
+            logging.info(f"Successfully updated access_flag for user {user_email}")
+    except Exception as e:
+        logging.error(f"Failed to update user access: {e}", exc_info=True)
+    finally:
+        if conn: conn.close()

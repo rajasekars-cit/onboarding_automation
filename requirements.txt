@@ -1,0 +1,10 @@
+# FILE: requirements.txt
+psycopg2-binary
+mysql-connector-python
+oracledb
+pyodbc
+msal
+requests
+schedule
+python-dotenv
+ollama
