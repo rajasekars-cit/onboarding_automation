@@ -14,7 +14,7 @@ This application provides a robust, scalable, and intelligent solution to automa
 - **Active Directory Integration:**
   - **Line Manager Validation:** Automatically verifies that an onboarding request comes from the user's official line manager via the Microsoft Graph API.
   - **Group Membership Validation:** Ensures the user is a member of a required AD group before initiating the onboarding process.
-- **Multi-Stage Approval Workflows:** Supports complex, sequential approval chains (e.g., Stage 1: Line Manager, Stage 2: IT Security), automatically routing requests to the next stage upon completion.
+- **Multi-Stage Approval Workflows:** Supports complex, sequential approval chains (e.g., Stage 1: Line Manager, Stage 2: Account Owner), automatically routing requests to the next stage upon completion.
 - **Local LLM Powered:** Uses a local Ollama instance for email intent classification and entity extraction, ensuring data privacy and cost control.
 - **Scalable Architecture:** Built on a producer-consumer model with a fixed-size thread pool, allowing it to handle hundreds of configurations efficiently without overwhelming the system.
 - **Automated Notifications:** Sends automated emails for approvals, rejections (with reasons), confirmations, and reminders for pending requests.
